@@ -1,0 +1,19 @@
+# Spike S4: the template's paths-ignore rule on its own. Compare with the Claims printer, which has no path filter.
+name: S4 paths-ignore probe
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - 'content/**'
+permissions: {}
+jobs:
+  facts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Push facts
+        run: |
+          jq '{event: env.GITHUB_EVENT_NAME, ref, created, deleted, forced, before, after,
+               pusher: .pusher.name, sender: .sender.login, sender_type: .sender.type,
+               files: [(.commits // [])[] | (.added + .modified + .removed)[]] | unique}' "$GITHUB_EVENT_PATH" \
+            | tee -a "$GITHUB_STEP_SUMMARY"

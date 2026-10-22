@@ -1,0 +1,40 @@
+# Spike S1/S2/S3 (keyless editor builds design, section 9). Asks GitHub for identity cards under every trigger the
+# design reasons about and prints what they carry. Scratch repository only; it sends nothing to Conloca.
+name: Claims printer
+on:
+  push:
+    branches: ['**']
+    tags: ['spike-*']
+  workflow_dispatch:
+    inputs:
+      keep_expired_card:
+        description: Keep card A as an artifact after it has expired (S2 local Worker check)
+        type: boolean
+        default: false
+  pull_request:
+  pull_request_target:
+  workflow_call:
+    inputs:
+      keep_expired_card:
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  card:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # The default branch's copy of the printer, never a pull request's code (this also serves pull_request_target).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions
+            tools
+      - uses: ./.github/actions/print-card
+        with:
+          keep-expired-card: ${{ inputs.keep_expired_card && 'true' || 'false' }}

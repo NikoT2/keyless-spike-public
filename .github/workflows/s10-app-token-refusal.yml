@@ -1,0 +1,30 @@
+# Spike S10 (and design 5.2's [I]): what GitHub answers when an App installation token without the `workflows`
+# permission pushes a workflow file. GITHUB_TOKEN is such a token (the GitHub Actions App), so this captures the
+# App-flavoured refusal with no Conloca key. Expected: the push is refused and no branch appears.
+name: S10 app-token refusal
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  push-workflow-file:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Try to push a new workflow file with GITHUB_TOKEN
+        run: |
+          set -uo pipefail
+          git config user.name 's10-probe'; git config user.email 's10-probe@users.noreply.github.com'
+          branch="s10/app-token-refusal-${GITHUB_RUN_ID}"
+          git switch -c "$branch"
+          mkdir -p .github/workflows
+          printf 'name: should not exist\non: workflow_dispatch\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n' > .github/workflows/s10-should-not-exist.yml
+          git add .github/workflows/s10-should-not-exist.yml && git commit -qm 's10: workflow file pushed with GITHUB_TOKEN'
+          if git push origin "$branch" 2> push-stderr.txt; then
+            echo "UNEXPECTED: the push was accepted; delete branch $branch by hand" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Refused as expected. GitHub said:" | tee -a "$GITHUB_STEP_SUMMARY"
+          sed 's/^/    /' push-stderr.txt | tee -a "$GITHUB_STEP_SUMMARY"

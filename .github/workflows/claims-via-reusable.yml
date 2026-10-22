@@ -1,0 +1,11 @@
+# Spike S1: the same printer as a job inside a reusable workflow, so job_workflow_ref differs from workflow_ref.
+name: Claims via reusable
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  same-repo:
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/claims-printer.yml

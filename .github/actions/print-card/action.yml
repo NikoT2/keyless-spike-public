@@ -1,0 +1,173 @@
+# Spike S1/S2/S3: records what GitHub put on this run's identity card (OIDC token). It prints the decoded header
+# and claims and jose's verdict against GitHub's live key list. It never prints a card: each one is masked the
+# moment it arrives and lives only in a mode-600 file under RUNNER_TEMP.
+name: Print identity card
+description: Ask GitHub for identity cards, verify them with jose, print the decoded claims (never the card)
+inputs:
+  sign-in-origin:
+    description: Conloca sign-in origin the audience names (a label only; nothing is sent there)
+    default: https://app.staging.conloca.com
+  keep-expired-card:
+    description: "'true' waits until card A has expired, then keeps it as a 1-day artifact for the local Worker check"
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Run and event facts (no card)
+      shell: bash
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/card-out"; mkdir -p "$out"; chmod 700 "$out"
+        jq -n \
+          --arg event "$GITHUB_EVENT_NAME" --arg ref "$GITHUB_REF" --arg ref_type "${GITHUB_REF_TYPE:-}" \
+          --arg sha "$GITHUB_SHA" --arg actor "$GITHUB_ACTOR" --arg triggering_actor "${GITHUB_TRIGGERING_ACTOR:-}" \
+          --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+          --arg workflow_ref "${GITHUB_WORKFLOW_REF:-}" --arg workflow_sha "${GITHUB_WORKFLOW_SHA:-}" \
+          --arg runner_env "${RUNNER_ENVIRONMENT:-}" --arg runner_os "$RUNNER_OS" --arg image "${ImageOS:-}/${ImageVersion:-}" \
+          --arg has_url "$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)" \
+          --arg has_token "$([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no)" \
+          --slurpfile e "$GITHUB_EVENT_PATH" '{
+            event: $event, ref: $ref, ref_type: $ref_type, sha: $sha, actor: $actor, triggering_actor: $triggering_actor,
+            run_id: $run_id, run_attempt: $run_attempt, workflow_ref: $workflow_ref, workflow_sha: $workflow_sha,
+            runner_environment: $runner_env, runner: ($runner_os + " " + $image),
+            id_token_request_url_present: $has_url, id_token_request_token_present: $has_token,
+            push: ($e[0] | if has("pusher") then {
+              created, deleted, forced, before, after, base_ref,
+              pusher: .pusher.name, sender: .sender.login, sender_type: .sender.type,
+              commits: [(.commits // [])[] | {id: .id[0:12], author: .author.username, committer: .committer.username,
+                added, modified, removed}]
+            } else null end),
+            pull_request: ($e[0].pull_request // null | if . then {
+              number, head_sha: .head.sha, head_ref: .head.ref, head_repo: .head.repo.full_name,
+              head_is_fork: .head.repo.fork, base_ref: .base.ref, author_association
+            } else null end),
+            workflow_run: ($e[0].workflow_run // null | if . then {
+              id, event, head_branch, head_sha, conclusion, head_repository: .head_repository.full_name,
+              head_repository_is_fork: .head_repository.fork
+            } else null end)
+          }' | tee "$out/event-facts.json"
+        {
+          echo "### Tools on this runner (S9)"
+          echo '```'
+          curl --version | head -1; jq --version; sha256sum --version | head -1
+          node --version; npm --version; python3 --version; base64 --version | head -1
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Ask GitHub for cards (masked, never printed)
+      shell: bash
+      env:
+        SIGN_IN_ORIGIN: ${{ inputs.sign-in-origin }}
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/card-out"; cards="$RUNNER_TEMP/cards"; mkdir -p "$cards"; chmod 700 "$cards"
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "NO CARD: GitHub gave this run no way to ask for one (event=$GITHUB_EVENT_NAME)." | tee "$out/no-card.txt"
+          echo "**No card** for event \`$GITHUB_EVENT_NAME\`: ACTIONS_ID_TOKEN_REQUEST_URL is unset." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        # A stand-in manifest, so the audience carries a real hash the verifier can compare (design 3.4 step 5).
+        jq -nc --arg commit "$GITHUB_SHA" --arg branch "${GITHUB_REF_NAME}" --arg run "$GITHUB_RUN_ID" \
+          '{version: 1, spike: "claims-printer", commit: $commit, branch: $branch, run_id: $run}' > "$out/manifest.json"
+        hash=$(sha256sum "$out/manifest.json" | cut -d' ' -f1)
+        audience="${SIGN_IN_ORIGIN%/}/editor-files/sha256:${hash}"
+        echo "audience requested: $audience" | tee "$out/audience.txt"
+        ask() { # $1 = file name; remaining args = extra curl arguments
+          local name="$1"; shift
+          local status
+          status=$(curl -sS --retry 3 -o "$cards/$name.json" -w '%{http_code}' \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$@") || status="curl-failed"
+          if [ "$status" != "200" ]; then
+            echo "card $name: GitHub answered $status: $(jq -c . "$cards/$name.json" 2>/dev/null || head -c 300 "$cards/$name.json")" | tee -a "$out/requests.txt"
+            rm -f "$cards/$name.json"; return 0
+          fi
+          local card; card=$(jq -r .value "$cards/$name.json"); rm -f "$cards/$name.json"
+          echo "::add-mask::${card}"
+          ( umask 077; printf '%s' "$card" > "$cards/$name.jwt" )
+          echo "card $name: received (${#card} characters)" | tee -a "$out/requests.txt"
+        }
+        # A: exactly the template's request (audience appended unencoded, design 3.1).
+        ask A "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}"
+        # B: the same audience URL-encoded, as GitHub's own toolkit sends it.
+        ask B -G --data-urlencode "audience=${audience}" "${ACTIONS_ID_TOKEN_REQUEST_URL}"
+        # C: no audience at all (GitHub's default, for contrast).
+        ask C "${ACTIONS_ID_TOKEN_REQUEST_URL}"
+        # D: A again, to see whether jti and iat change between two requests in one job (design 3.7).
+        ask D "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}"
+
+    - name: Verify with jose against GitHub's live key list (prints claims, never the card)
+      shell: bash
+      env:
+        SIGN_IN_ORIGIN: ${{ inputs.sign-in-origin }}
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/card-out"; cards="$RUNNER_TEMP/cards"
+        ls "$cards"/*.jwt >/dev/null 2>&1 || { echo "no cards to verify"; exit 0; }
+        v="$RUNNER_TEMP/verifier"; mkdir -p "$v"; cp "$GITHUB_WORKSPACE"/tools/*.mjs "$v/"
+        printf '{"type":"module","private":true}\n' > "$v/package.json"
+        # The spike's printer (not the template) installs jose, exact version, no install scripts.
+        npm install --prefix "$v" --no-save --ignore-scripts --no-audit --no-fund --loglevel=error jose@6.2.12
+        own_path="${GITHUB_WORKFLOW_REF#*/*/}"; own_path="${own_path%@*}"
+        echo "this run's workflow file: $own_path"
+        for f in "$cards"/*.jwt; do
+          n=$(basename "$f" .jwt)
+          node "$v/verify-card.mjs" --card-file "$f" --sign-in-origin "$SIGN_IN_ORIGIN" \
+            --workflow-path "$own_path" --manifest "$out/manifest.json" --out "$out/report-$n-own-workflow.json" >/dev/null || true
+          node "$v/verify-card.mjs" --card-file "$f" --sign-in-origin "$SIGN_IN_ORIGIN" \
+            --manifest "$out/manifest.json" --out "$out/report-$n-pinned-workflow.json" >/dev/null || true
+          echo "== card $n: verdict with this workflow's own path / with the pinned conloca-editor.yml path"
+          jq -c '{verdict, reason, signature: .signature.ok, sigError: .signature.error, kid: .header.kid}' "$out/report-$n-own-workflow.json"
+          jq -c '{verdict, reason}' "$out/report-$n-pinned-workflow.json"
+        done
+        [ -f "$out/report-A-own-workflow.json" ] || { echo "card A was not issued; see requests.txt"; cat "$out/requests.txt"; exit 0; }
+        echo "== card A claims (decoded)"; jq .claims "$out/report-A-own-workflow.json"
+        echo "== card A rule by rule"; jq -r '.rules[] | "\(if .ok then "pass" else "FAIL" end)  \(.name)  -> \(.reason)  \(.detail)"' "$out/report-A-own-workflow.json"
+        compare() { jq -n --slurpfile a "$out/report-A-own-workflow.json" --slurpfile o "$out/report-$1-own-workflow.json" "$2"; }
+        [ -f "$out/report-B-own-workflow.json" ] && compare B '{aud_A: $a[0].claims.aud, aud_B: $o[0].claims.aud, same_aud: ($a[0].claims.aud == $o[0].claims.aud)}'
+        [ -f "$out/report-C-own-workflow.json" ] && compare C '{default_aud: $o[0].claims.aud}'
+        [ -f "$out/report-D-own-workflow.json" ] && compare D '{same_jti: ($a[0].claims.jti == $o[0].claims.jti), iat_A: $a[0].claims.iat, iat_D: $o[0].claims.iat}'
+        {
+          echo "### Card A (event \`$GITHUB_EVENT_NAME\`, attempt $GITHUB_RUN_ATTEMPT)"
+          echo
+          echo '| claim | value |'; echo '|---|---|'
+          jq -r '.claims as $c | ["sub","aud","sha","workflow_sha","ref","ref_type","ref_protected","event_name","workflow_ref","job_workflow_ref","job_workflow_sha","runner_environment","repository","repository_id","repository_owner_id","repository_visibility","run_id","run_attempt","actor","actor_id","jti","iat","nbf","exp","issuer_scope","check_run_id","head_ref","base_ref","environment"][] as $k | "| \($k) | \($c[$k] // "(absent)") |"' "$out/report-A-own-workflow.json"
+          echo
+          jq -r '"Verdict with own path: **\(.verdict)** \(.reason // ""); signature ok: \(.signature.ok); lifetime \(.facts.lifetimeSeconds)s"' "$out/report-A-own-workflow.json"
+          jq -r '"Verdict with pinned conloca-editor.yml: **\(.verdict)** \(.reason // "")"' "$out/report-A-pinned-workflow.json"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Keep the decoded records (no cards)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: claims-${{ github.event_name }}-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/card-out
+        retention-days: 7
+        if-no-files-found: error
+
+    - name: Wait until card A has expired, then keep it for the local Worker check (opt-in)
+      id: expired
+      if: inputs.keep-expired-card == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/card-out"; cards="$RUNNER_TEMP/cards"; keep="$RUNNER_TEMP/expired-card"
+        [ -f "$cards/A.jwt" ] || { echo "no card A"; exit 0; }
+        exp=$(jq -r .claims.exp "$out/report-A-own-workflow.json")
+        wait=$(( exp + 90 - $(date +%s) ))
+        [ "$wait" -le 900 ] || { echo "card lives longer than expected ($wait s left); not keeping it"; exit 0; }
+        [ "$wait" -gt 0 ] && sleep "$wait"
+        # Refuse to keep it unless the verifier itself now calls it expired.
+        node "$RUNNER_TEMP/verifier/verify-card.mjs" --card-file "$cards/A.jwt" --sign-in-origin x --out "$out/expired-check.json" >/dev/null || true
+        jq -e '.signature.error | test("ERR_JWT_EXPIRED")' "$out/expired-check.json" >/dev/null
+        mkdir -p "$keep"; chmod 700 "$keep"; cp "$cards/A.jwt" "$out/manifest.json" "$keep/"
+        echo "card A expired at $exp; kept"
+        echo "kept=true" >> "$GITHUB_OUTPUT"
+
+    - name: Keep the expired card (1 day)
+      if: steps.expired.outputs.kept == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: expired-card-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/expired-card
+        retention-days: 1
+        if-no-files-found: ignore
